@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: uphi-backend
+    
+  data:
+    mongodb:
+      uri: "mongodb://127.0.0.1:27017/uphi"
+  mongodb:
+    uri: "mongodb://127.0.0.1:27017/uphi"
+
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: ${MAIL_USERNAME:uphi.med@gmail.com}
+    password: ${MAIL_PASSWORD:your_app_password}
+
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+
+server:
+  port: 8080
+
+jwt:
+  secret: ${JWT_SECRET:aGVyZUlzQU11Y2hMb25nZXJTZWNyZXRLZXlUaGF0TXVzdEJlQXRMZWFzdDJGNTZCb2R5RGF0YQ==}
+  expiration: 86400000 # 24 hours in milliseconds
+
+gemini:
+  api-key: ${GEMINI_API_KEY:your_api_key}
+  model: gemini-2.0-flash
+ 
+

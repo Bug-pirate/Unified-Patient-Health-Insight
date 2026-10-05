@@ -1,0 +1,260 @@
+package com.uphi.backend.service;
+
+import com.uphi.backend.domain.Role;
+import com.uphi.backend.domain.User;
+import com.uphi.backend.domain.Patient;
+import com.uphi.backend.domain.models.Condition;
+import com.uphi.backend.domain.models.RelatedPerson;
+import com.uphi.backend.repository.UserRepository;
+import com.uphi.backend.repository.PatientRepository;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import java.util.List;
+
+
+@Service
+public class ReceptionistService {
+
+    private final UserRepository userRepository;
+    private final PatientRepository patientRepository;
+    private final OtpService otpService;
+    private final PasswordEncoder passwordEncoder;
+
+    public ReceptionistService(UserRepository userRepository, PatientRepository patientRepository, OtpService otpService, PasswordEncoder passwordEncoder) {
+        this.userRepository = userRepository;
+        this.patientRepository = patientRepository;
+        this.otpService = otpService;
+        this.passwordEncoder = passwordEncoder;
+    }
+
+    private User verifyReceptionistOrAdmin(String requesterUsername) {
+        if ("SELF".equals(requesterUsername)) return null; // Allow self-registration
+        
+        User requester = userRepository.findByUsername(requesterUsername)
+                .orElseThrow(() -> new SecurityException("Requester not found."));
+
+        if (requester.getRole() != Role.RECEPTIONIST && requester.getRole() != Role.ADMIN && requester.getRole() != Role.MAIN_ADMIN) {
+            throw new SecurityException("Insufficient privileges. Only Receptionists or Admins can manage Patients.");
+        }
+        return requester;
+    }
+
+    public String requestPatientOtp(String targetEmail) {
+        return otpService.generateAndSendOtp(targetEmail);
+    }
+ 
+    public boolean validateOtpOnly(String identity, String otp) {
+        return otpService.validateOtp(identity, otp, false);
+    }
+
+
+    public Patient registerPatient(String requesterUsername, String email, String phone, String otp, String fullName, String dob, String gender, String bloodGroup, String address, String aadhaar, String abha, List<Condition> oldDiagnosis, List<com.uphi.backend.domain.models.Allergy> allergies, String emergencyContactName, String emergencyContactPhone, int age, List<com.uphi.backend.domain.models.Medication> medications) {
+        User requester = null;
+        if (!"SELF".equals(requesterUsername)) {
+             requester = verifyReceptionistOrAdmin(requesterUsername);
+        }
+
+        // Verify the OTP — use email if available, otherwise phone
+        String otpIdentity = (email != null && !email.isEmpty()) ? email : phone;
+        if (!otpService.verifyOtp(otpIdentity, otp)) {
+            throw new IllegalArgumentException("Invalid or expired OTP code.");
+        }
+
+        java.util.Optional<User> existingUserOpt = (email != null && !email.isEmpty()) ? userRepository.findByEmail(email.trim().toLowerCase()) : java.util.Optional.empty();
+        java.util.Optional<Patient> existingPatientOpt = (abha != null && !abha.isEmpty()) ? patientRepository.findByAbhaAddress(abha) : java.util.Optional.empty();
+
+        // Check duplicate email logic
+        if (existingUserOpt.isPresent()) {
+            Patient existingPatientOfUser = patientRepository.findByUserId(existingUserOpt.get().getId()).orElse(null);
+            if (existingPatientOfUser != null) {
+                // 1. If it's a SELF registration, reject immediately
+                if ("SELF".equals(requesterUsername)) {
+                    throw new IllegalArgumentException("Email is already registered.");
+                }
+                // 2. If ABHA address is provided and doesn't match the existing patient's ABHA, reject
+                if (abha != null && !abha.isEmpty() && !abha.equals(existingPatientOfUser.getAbhaAddress())) {
+                    throw new IllegalArgumentException("Email is already registered to a different patient.");
+                }
+                // 3. If Aadhaar is provided and doesn't match the existing patient's Aadhaar, reject
+                if (aadhaar != null && !aadhaar.isEmpty() && existingPatientOfUser.getAadhaar() != null && !existingPatientOfUser.getAadhaar().isEmpty() && !aadhaar.equals(existingPatientOfUser.getAadhaar())) {
+                    throw new IllegalArgumentException("Email is already registered to a different patient.");
+                }
+            }
+        }
+
+        // Also check by phone for duplicate prevention
+        if (existingUserOpt.isEmpty() && phone != null && !phone.isEmpty()) {
+            existingUserOpt = userRepository.findByMobile(phone);
+        }
+
+        final String existingUserId = existingUserOpt.isPresent() ? existingUserOpt.get().getId() : null;
+        if (existingUserOpt.isPresent() || existingPatientOpt.isPresent()) {
+            Patient existingPatient = existingPatientOpt.orElseGet(() -> patientRepository.findByUserId(existingUserId).orElseThrow(() -> new IllegalArgumentException("Patient record not found for existing user. Please contact support.")));
+            existingPatient.setFullName(fullName);
+            existingPatient.setPhone(phone);
+            existingPatient.setDob(dob);
+            existingPatient.setGender(gender);
+            existingPatient.setBloodGroup(bloodGroup);
+            if (oldDiagnosis != null && !oldDiagnosis.isEmpty()) {
+                existingPatient.setConditions(oldDiagnosis);
+            }
+            if (allergies != null && !allergies.isEmpty()) {
+                existingPatient.setAllergies(allergies);
+            }
+            if (medications != null && !medications.isEmpty()) {
+                existingPatient.setMedications(medications);
+            }
+            // Update emergency contact if provided
+            if (emergencyContactName != null && !emergencyContactName.isEmpty()) {
+                com.uphi.backend.domain.models.EmergencyContact ec = existingPatient.getEmergencyContact();
+                if (ec == null) ec = new com.uphi.backend.domain.models.EmergencyContact();
+                ec.setName(emergencyContactName);
+                ec.setPhone(emergencyContactPhone);
+                existingPatient.setEmergencyContact(ec);
+            }
+            // Update address in ContactInfo
+            if (address != null && !address.isEmpty()) {
+                com.uphi.backend.domain.models.ContactInfo ci = existingPatient.getContactInfo();
+                if (ci == null) ci = new com.uphi.backend.domain.models.ContactInfo();
+                ci.setAddress(address);
+                existingPatient.setContactInfo(ci);
+            }
+            // Update age
+            if (age > 0) {
+                existingPatient.setAge(age);
+            } else if (dob != null && !dob.isEmpty()) {
+                existingPatient.setAge(calculateAgeFromDob(dob));
+            }
+            if (existingPatient.getAffiliatedHospitals() == null) {
+                existingPatient.setAffiliatedHospitals(new java.util.HashSet<>());
+            }
+            if (requester != null && requester.getHospitalId() != null) {
+                existingPatient.getAffiliatedHospitals().add(requester.getHospitalId());
+            }
+            return patientRepository.save(existingPatient);
+        }
+
+        String generatedAbha = (abha != null && !abha.isEmpty()) ? abha : "ABHA-" + System.currentTimeMillis();
+
+        User newUser = new User();
+        newUser.setUsername(generatedAbha);
+        newUser.setEmail(email);
+        newUser.setPasswordHash(passwordEncoder.encode("PatientSecure@" + email.split("@")[0])); // Default secure pass
+
+        newUser.setRole(Role.PATIENT);
+        newUser.setMobile(phone); // Save phone for universal login
+        newUser.setCreatedAt(java.time.Instant.now());
+        User savedUser = userRepository.save(newUser);
+
+        Patient patient = new Patient();
+        patient.setUserId(savedUser.getId());
+        patient.setAbhaAddress(generatedAbha);
+        patient.setFullName(fullName);
+        patient.setEmail(email);
+        patient.setPhone(phone);
+        patient.setDob(dob);
+        patient.setGender(gender);
+        patient.setBloodGroup(bloodGroup);
+        patient.setAadhaar(aadhaar);
+        patient.setConditions(oldDiagnosis != null ? oldDiagnosis : List.of());
+
+        // Store allergies
+        if (allergies != null && !allergies.isEmpty()) {
+            patient.setAllergies(allergies);
+        }
+
+        // Store medications
+        if (medications != null && !medications.isEmpty()) {
+            patient.setMedications(medications);
+        }
+
+        // Store address in ContactInfo
+        if (address != null && !address.isEmpty()) {
+            com.uphi.backend.domain.models.ContactInfo contactInfo = new com.uphi.backend.domain.models.ContactInfo();
+            contactInfo.setAddress(address);
+            patient.setContactInfo(contactInfo);
+        }
+
+        // Store emergency contact
+        if (emergencyContactName != null && !emergencyContactName.isEmpty()) {
+            com.uphi.backend.domain.models.EmergencyContact ec = new com.uphi.backend.domain.models.EmergencyContact();
+            ec.setName(emergencyContactName);
+            ec.setPhone(emergencyContactPhone);
+            patient.setEmergencyContact(ec);
+        }
+
+        // Compute and store age
+        if (age > 0) {
+            patient.setAge(age);
+        } else if (dob != null && !dob.isEmpty()) {
+            patient.setAge(calculateAgeFromDob(dob));
+        }
+
+        // Multi-Tenancy Patient Siphoning
+        if (patient.getAffiliatedHospitals() == null) {
+            patient.setAffiliatedHospitals(new java.util.HashSet<>());
+        }
+        if (requester != null && requester.getHospitalId() != null) {
+             patient.getAffiliatedHospitals().add(requester.getHospitalId());
+        }
+
+        return patientRepository.save(patient);
+    }
+
+    private int calculateAgeFromDob(String dob) {
+        try {
+            java.time.LocalDate birthDate = java.time.LocalDate.parse(dob);
+            return java.time.Period.between(birthDate, java.time.LocalDate.now()).getYears();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    public void removePatient(String requesterUsername, String patientId) {
+        verifyReceptionistOrAdmin(requesterUsername);
+        
+        Patient patient = patientRepository.findById(patientId)
+                .orElseThrow(() -> new IllegalArgumentException("Patient not found."));
+                
+        patientRepository.delete(patient);
+        userRepository.deleteById(patient.getUserId());
+    }
+
+    public Patient getPatientById(String id) {
+        return patientRepository.findById(id)
+                .or(() -> patientRepository.findByAbhaAddress(id))
+                .orElseThrow(() -> new IllegalArgumentException("Patient not found with ID or ABHA: " + id));
+    }
+
+    public Patient updatePatient(Patient patient) {
+        return patientRepository.save(patient);
+    }
+
+    public List<Patient> getAllPatients(String requesterUsername) {
+        User requester = userRepository.findByUsername(requesterUsername)
+            .orElseThrow(() -> new SecurityException("User not found"));
+            
+        if (requester.getRole() == Role.MAIN_ADMIN) {
+            return patientRepository.findAll();
+        } else if (requester.getHospitalId() != null) {
+            return patientRepository.findByAffiliatedHospitalsContaining(requester.getHospitalId());
+        } else {
+            return List.of(); // User has no hospital ID, cannot see patients
+        }
+    }
+
+    public void addRelatedPerson(String patientId, RelatedPerson relative, String otp) {
+        // Verification step
+        if (!otpService.verifyOtp(relative.getEmail(), otp)) {
+            throw new IllegalArgumentException("Invalid or expired Security OTP for relative.");
+        }
+
+        Patient patient = patientRepository.findById(patientId)
+                .orElseThrow(() -> new IllegalArgumentException("Primary patient record not found."));
+
+        relative.setVerified(true);
+        patient.getRelatedPersons().add(relative);
+        patientRepository.save(patient);
+    }
+}
+
